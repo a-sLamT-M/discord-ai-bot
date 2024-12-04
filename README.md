@@ -1,3 +1,6 @@
+### THIS IS A FORK
+OH MY GOD, A FORK!
+
 <div align="center">
     <h1><a href="#"></a>Discord AI Bot</h1>
     <h3 align="center"><a href="#"></a>Discord bot to interact with <a href="https://github.com/jmorganca/ollama">Ollama</a> and <a href="https://github.com/AUTOMATIC1111/stable-diffusion-webui">AUTOMATIC1111 Stable Diffusion</a> as a chatbot</h3>

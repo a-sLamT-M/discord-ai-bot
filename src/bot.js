@@ -1,22 +1,24 @@
-import {
-	Client,
-	Events,
-	GatewayIntentBits,
-	MessageType,
-	Partials,
-	REST,
-	Routes
-} from "discord.js";
-import { Logger, LogLevel } from "meklog";
+import {Client, Events, GatewayIntentBits, MessageType, Partials, REST, Routes} from "discord.js";
+import {Logger, LogLevel} from "meklog";
 import dotenv from "dotenv";
 import axios from "axios";
 import commands from "./commands/commands.js";
 
 dotenv.config();
 
+const aiOptions = {
+	num_predict: 1024,
+	temperature: 0.8,
+	num_ctx: 8192,
+	repeat_last_n: 64,
+}
+
 const model = process.env.MODEL;
-const servers = process.env.OLLAMA.split(",").map(url => ({ url: new URL(url), available: true }));
-const stableDiffusionServers = process.env.STABLE_DIFFUSION.split(",").map(url => ({ url: new URL(url), available: true }));
+const servers = process.env.OLLAMA.split(",").map(url => ({url: new URL(url), available: true}));
+const stableDiffusionServers = process.env.STABLE_DIFFUSION.split(",").map(url => ({
+	url: new URL(url),
+	available: true
+}));
 const channels = process.env.CHANNELS.split(",");
 
 if (servers.length == 0) {
@@ -27,6 +29,8 @@ let log;
 process.on("message", data => {
 	if (data.shardID) client.shardID = data.shardID;
 	if (data.logger) log = new Logger(data.logger);
+	startTopicScheduler();
+	sendRandomTopic();
 });
 
 const logError = (error) => {
@@ -142,17 +146,17 @@ const client = new Client({
 		GatewayIntentBits.DirectMessages,
 		GatewayIntentBits.MessageContent
 	],
-	allowedMentions: { users: [], roles: [], repliedUser: false },
+	allowedMentions: {users: [], roles: [], repliedUser: false},
 	partials: [
 		Partials.Channel
 	]
 });
 
-const rest = new REST({ version: "10" }).setToken(process.env.TOKEN);
+const rest = new REST({version: "10"}).setToken(process.env.TOKEN);
 
 client.once(Events.ClientReady, async () => {
 	await client.guilds.fetch();
-	client.user.setPresence({ activities: [], status: "online" });
+	client.user.setPresence({activities: [], status: "online"});
 	await rest.put(Routes.applicationCommands(client.user.id), {
 		body: commands
 	});
@@ -160,7 +164,9 @@ client.once(Events.ClientReady, async () => {
 	log(LogLevel.Info, "Successfully reloaded application slash (/) commands.");
 });
 
-const messages = {};
+const messages = {
+
+};
 
 // split text so it fits in a Discord message
 function splitText(str, length) {
@@ -171,6 +177,7 @@ function splitText(str, length) {
 	const segments = [];
 	let segment = "";
 	let word, suffix;
+
 	function appendSegment() {
 		segment = segment.replace(/^\s+|\s+$/g, "");
 		if (segment.length > 0) {
@@ -178,6 +185,7 @@ function splitText(str, length) {
 			segment = "";
 		}
 	}
+
 	// match a word
 	while ((word = str.match(/^[^\s]*(?:\s+|$)/)) != null) {
 		suffix = "";
@@ -243,7 +251,7 @@ const useInitialPrompt = getBoolean(process.env.USE_INITIAL_PROMPT) && !!initial
 const requiresMention = getBoolean(process.env.REQUIRES_MENTION);
 
 async function replySplitMessage(replyMessage, content) {
-	const responseMessages = splitText(content, 2000).map(text => ({ content: text }));
+	const responseMessages = splitText(content, 2000).map(text => ({content: text}));
 
 	const replyMessages = [];
 	for (let i = 0; i < responseMessages.length; ++i) {
@@ -256,6 +264,163 @@ async function replySplitMessage(replyMessage, content) {
 	return replyMessages;
 }
 
+const usedTopics = new Set();
+
+function getUniqueRandomTopic() {
+	// if (usedTopics.size === topics.length) {
+	// 	usedTopics.clear();
+	// }
+	return topics[Math.floor(Math.random() * topics.length)];
+}
+
+async function sendRandomTopic() {
+	try {
+		const randomChannelID = channels[Math.floor(Math.random() * channels.length)];
+		const channel = await client.channels.fetch(randomChannelID);
+		const context = messages[randomChannelID]?.last;
+		if (!channel.isTextBased()) {
+			return;
+		}
+		// const topic = getUniqueRandomTopic();
+		const topic = await sendToAi("[[SYSTEM: {}]]", context);
+		console.log(topic);
+		// await handleReply(randomChannelID, "", topic.responseText, context, topic.response, messages);
+
+		const discordResponse = await channel.send(topic.responseText);
+		saveContext(randomChannelID, discordResponse, topic.response);
+	} catch (error) {
+		logError(error);
+	}
+}
+
+function startTopicScheduler() {
+	const minInterval = 1 * 60 * 1000;
+	const maxInterval = 60 * 60 * 1000;
+
+	function scheduleNextTopic() {
+		const interval = Math.random() * (maxInterval - minInterval) + minInterval;
+
+		// 等待该时间后触发发送话题
+		setTimeout(async () => {
+			await sendRandomTopic();
+			scheduleNextTopic();
+		}, interval);
+	}
+
+	scheduleNextTopic();
+}
+
+
+async function sendToAi(message, context) {
+	let response;
+	let userInput = message;
+	// context if the message is not a reply
+	if (context == null) {
+		context = [];
+	}
+
+	if (useInitialPrompt && messages[channelID].amount == 0) {
+		userInput = `${initialPrompt}\n\n${userInput}`;
+		log(LogLevel.Debug, "Adding initial prompt to message");
+	}
+
+	console.log({
+		model: model,
+		prompt: userInput,
+		system: getSystemMessage(),
+		options: aiOptions,
+		context
+	})
+
+	// make request to model
+	response = (await makeRequest("/api/generate", "post", {
+		model: model,
+		prompt: userInput,
+		system: getSystemMessage(),
+		options: aiOptions,
+		context
+	}));
+
+	if (typeof response != "string") {
+		log(LogLevel.Debug, response);
+		throw new TypeError("response is not a string, this may be an error with ollama");
+	}
+
+	response = response.split("\n").filter(e => !!e).map(e => {
+		return JSON.parse(e);
+	});
+
+	let responseText = response.map(e => e.response).filter(e => e != null).join("").trim();
+	if (responseText.length == 0) {
+		responseText = "(No response)";
+	}
+	return {
+		responseText,
+		response
+	}
+}
+/**
+ * Handles replying to a message, updating the context, and maintaining the conversation state.
+ *
+ * @param {string} channelID - The ID of the channel where the message is sent.
+ * @param {string} prefix - The prefix to prepend to the response text.
+ * @param {string} responseText - The text of the response to send.
+ * @param {object} context - The existing context of the conversation.
+ * @param {Array} response - The list of response objects that include context and done flag.
+ * @param {object} messages - The object storing message states for the channel.
+ * @param messageObj
+ *
+ * @returns {object} - Updated `messages` object with the new state.
+ */
+async function handleReply(channelID, prefix, responseText, context, response, messages, messageObj) {
+	// Send the reply and get the IDs of the sent messages
+	console.log(responseText)
+	const replyMessageIDs = (await replySplitMessage(messageObj,`${prefix}${responseText}`)).map(msg => msg.id);
+
+	// Update the conversation context
+	context = response.filter(e => e.done && e.context)[0].context;
+
+	// Map the new context to the sent messages
+	for (let i = 0; i < replyMessageIDs.length; ++i) {
+		messages[channelID][replyMessageIDs[i]] = context;
+	}
+
+	// Update the last message context and increment the message count
+	messages[channelID].last = context;
+	++messages[channelID].amount;
+
+	return messages;
+}
+
+function saveContext(channelID, messageObject, response) {
+	if(messages[channelID] == null) {
+		messages[channelID] = {
+			amount: 0
+		};
+	}
+	const context = response.filter(e => e.done && e.context)[0].context;
+	++messages[channelID].amount;
+	messages[channelID].last = context;
+	if (messageObject.id != null) {
+		messages[channelID][messageObject.id] = context;
+	}
+}
+
+function getSystemMessage() {
+	const systemMessages = [];
+
+	if (useModelSystemMessage && modelInfo.system) {
+		systemMessages.push(modelInfo.system);
+	}
+
+	if (useCustomSystemMessage) {
+		systemMessages.push(customSystemMessage);
+	}
+
+	// join them together
+	const systemMessage = systemMessages.join("\n\n");
+	return systemMessage;
+}
 client.on(Events.MessageCreate, async message => {
 	let typing = false;
 	try {
@@ -272,6 +437,7 @@ client.on(Events.MessageCreate, async message => {
 		const botRole = message.guild?.members?.me?.roles?.botRole;
 		const myMention = new RegExp(`<@((!?${client.user.id}${botRole ? `)|(&${botRole.id}` : ""}))>`, "g"); // RegExp to match a mention for the bot
 
+		// console.log(message);
 		if (typeof message.content !== "string" || message.content.length == 0) {
 			return;
 		}
@@ -296,18 +462,7 @@ client.on(Events.MessageCreate, async message => {
 			if (typeof modelInfo !== "object") throw "failed to fetch model information";
 		}
 
-		const systemMessages = [];
-
-		if (useModelSystemMessage && modelInfo.system) {
-			systemMessages.push(modelInfo.system);
-		}
-
-		if (useCustomSystemMessage) {
-			systemMessages.push(customSystemMessage);
-		}
-
-		// join them together
-		const systemMessage = systemMessages.join("\n\n");
+		const systemMessage = getSystemMessage();
 
 		// deal with commands first before passing to LLM
 		let userInput = message.content
@@ -329,16 +484,16 @@ client.on(Events.MessageCreate, async message => {
 						delete messages[channelID];
 
 						if (cleared > 0) {
-							await message.reply({ content: `Cleared conversation of ${cleared} messages` });
+							await message.reply({content: `Cleared conversation of ${cleared} messages`});
 							break;
 						}
 					}
-					await message.reply({ content: "No messages to clear" });
+					await message.reply({content: "No messages to clear"});
 					break;
 				case "help":
 				case "?":
 				case "h":
-					await message.reply({ content: "Commands:\n- `.reset` `.clear`\n- `.help` `.?` `.h`\n- `.ping`\n- `.model`\n- `.system`" });
+					await message.reply({content: "Commands:\n- `.reset` `.clear`\n- `.help` `.?` `.h`\n- `.ping`\n- `.model`\n- `.system`"});
 					break;
 				case "model":
 					await message.reply({
@@ -352,24 +507,25 @@ client.on(Events.MessageCreate, async message => {
 					// get ms difference
 					try {
 						const beforeTime = Date.now();
-						const reply = await message.reply({ content: "Ping" });
+						const reply = await message.reply({content: "Ping"});
 						const afterTime = Date.now();
 						const difference = afterTime - beforeTime;
-						await reply.edit({ content: `Ping: ${difference}ms` });
+						await reply.edit({content: `Ping: ${difference}ms`});
 					} catch (error) {
 						logError(error);
-						await message.reply({ content: "Error, please check the console" });
+						await message.reply({content: "<宕机>"});
 					}
 					break;
 				case "":
 					break;
 				default:
-					await message.reply({ content: "Unknown command, type `.help` for a list of commands" });
+					await message.reply({content: "Unknown command, type `.help` for a list of commands"});
 					break;
 			}
 			return;
 		}
 
+		// require mention?
 		if (message.type == MessageType.Default && (requiresMention && message.guild && !message.content.match(myMention))) return;
 
 		if (message.guild) {
@@ -399,9 +555,21 @@ client.on(Events.MessageCreate, async message => {
 			})
 			.trim();
 
+		const systemCommand = userInput.match(/^\[\[SYSTEM: (.*?)\]\]$/);
+		if (systemCommand && systemCommand[1]) {
+			userInput = systemCommand[1];
+		}
+
+
+		const date = new Date().toISOString();
+		const channel = message.channelId;
+		const somebody = message.author.globalName;
+
+		userInput = `<|<-[${date}] [${channel}] [${somebody}]: ${userInput}>|>`;
+		console.log("Formatted User Input:", userInput);
+
 		if (userInput.length == 0) return;
 
-		// Process text files if attached
 		if (message.attachments.size > 0) {
 			const textAttachments = Array.from(message.attachments, ([, value]) => value).filter(att => att.contentType.startsWith("text"));
 			if (textAttachments.length > 0) {
@@ -412,7 +580,7 @@ client.on(Events.MessageCreate, async message => {
 					}));
 				} catch (error) {
 					log(LogLevel.Error, `Failed to download text files: ${error}`);
-					await message.reply({ content: "Failed to download text files" });
+					await message.reply({content: "Failed to download text files"});
 					return; // Stop processing if file download fails
 				}
 			}
@@ -420,7 +588,7 @@ client.on(Events.MessageCreate, async message => {
 
 		// create conversation
 		if (messages[channelID] == null) {
-			messages[channelID] = { amount: 0, last: null };
+			messages[channelID] = {amount: 0, last: null};
 		}
 
 		// log user's message
@@ -442,33 +610,12 @@ client.on(Events.MessageCreate, async message => {
 		}, 7000);
 
 		let response;
+		let responseText;
+		let fullResponse;
 		try {
-			// context if the message is not a reply
-			if (context == null) {
-				context = messages[channelID].last;
-			}
-
-			if (useInitialPrompt && messages[channelID].amount == 0) {
-				userInput = `${initialPrompt}\n\n${userInput}`;
-				log(LogLevel.Debug, "Adding initial prompt to message");
-			}
-
-			// make request to model
-			response = (await makeRequest("/api/generate", "post", {
-				model: model,
-				prompt: userInput,
-				system: systemMessage,
-				context
-			}));
-
-			if (typeof response != "string") {
-				log(LogLevel.Debug, response);
-				throw new TypeError("response is not a string, this may be an error with ollama");
-			}
-
-			response = response.split("\n").filter(e => !!e).map(e => {
-				return JSON.parse(e);
-			});
+			fullResponse = await sendToAi(userInput, context);
+			responseText = fullResponse.responseText;
+			response = fullResponse.response;
 		} catch (error) {
 			if (typingInterval != null) {
 				clearInterval(typingInterval);
@@ -476,37 +623,31 @@ client.on(Events.MessageCreate, async message => {
 			typingInterval = null;
 			throw error;
 		}
-
+		if (responseText.length == 0) {
+			responseText = "(No response)";
+		}
 		if (typingInterval != null) {
 			clearInterval(typingInterval);
 		}
 		typingInterval = null;
 
-		let responseText = response.map(e => e.response).filter(e => e != null).join("").trim();
-		if (responseText.length == 0) {
-			responseText = "(No response)";
-		}
-
 		log(LogLevel.Debug, `Response: ${responseText}`);
-
+		// 输出格式 (其中，{} 是回复)：
+		// \"<|<-{}>|>\"
 		const prefix = showStartOfConversation && messages[channelID].amount == 0 ?
 			"> This is the beginning of the conversation, type `.help` for help.\n\n" : "";
-
+		// delete <|<- and >|> from response
+		responseText = responseText.replace(/<\|<-(.*?)>\|>/g, "$1");
 		// reply (will automatically stop typing)
-		const replyMessageIDs = (await replySplitMessage(message, `${prefix}${responseText}`)).map(msg => msg.id);
+		// const replyMessageIDs = (await replySplitMessage(message, `${prefix}${responseText}`)).map(msg => msg.id);
 
 		// add response to conversation
-		context = response.filter(e => e.done && e.context)[0].context;
-		for (let i = 0; i < replyMessageIDs.length; ++i) {
-			messages[channelID][replyMessageIDs[i]] = context;
-		}
-		messages[channelID].last = context;
-		++messages[channelID].amount;
+		await handleReply(channelID, prefix, responseText, context, response, messages, message);
 	} catch (error) {
 		if (typing) {
 			try {
 				// return error
-				await message.reply({ content: "Error, please check the console" });
+				await message.reply({content: "<宕机>"});
 			} catch (ignored) {
 				logError(ignored);
 			}
@@ -518,7 +659,7 @@ client.on(Events.MessageCreate, async message => {
 client.on(Events.InteractionCreate, async (interaction) => {
 	if (!interaction.isCommand()) return;
 
-	const { commandName, options } = interaction;
+	const {commandName, options} = interaction;
 
 	switch (commandName) {
 		case "text2img":
@@ -556,11 +697,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
 			} catch (error) {
 				logError(error);
 				await interaction.editReply({
-					content: "Error, please check the console"
+					content: "<宕机>"
 				});
 			}
 			break;
 	}
 });
+client.once(Events.ClientReady, () => {
 
+});
 client.login(process.env.TOKEN);
